@@ -7,64 +7,62 @@ import asyncio
 
 app = FastAPI(title="RubinOT Scraper - Grátis")
 
-# Scraper com configuração mais forte contra Cloudflare 2026
+# === CONFIGURAÇÃO MAIS FORTE CONTRA CLOUDFLARE 2026 ===
 scraper = cloudscraper.create_scraper(
     browser={
         'browser': 'chrome',
         'platform': 'windows',
         'mobile': False
     },
-    delay=8,           # delay entre requests
+    delay=10,                    # delay maior
     debug=False
 )
 
-# Cache simples (5 minutos)
+# Cache (5 minutos)
 cache = {}
 CACHE_TTL = 300
 
 @app.get("/")
 def root():
     return {
-        "message": "✅ RubinOT Scraper está ONLINE (bypass Cloudflare reforçado)",
+        "message": "✅ RubinOT Scraper ONLINE (bypass reforçado + debug)",
         "status": "ok",
-        "uso": "https://rubinot-scraper.onrender.com/search?nome=SeuNome",
-        "endpoints": ["/search", "/health"]
+        "teste": "https://rubinot-scraper.onrender.com/search?nome=Mekbek"
     }
-
-@app.get("/health")
-def health():
-    return {"status": "healthy", "timestamp": time.time()}
 
 @app.get("/search")
 async def search(nome: str = Query(..., description="Nome do personagem")):
     key = nome.strip().lower()
 
-    # Cache
     if key in cache and time.time() - cache[key]["timestamp"] < CACHE_TTL:
         return cache[key]["data"]
 
-    for attempt in range(3):  # 3 tentativas
+    print(f"[DEBUG] Buscando: {nome} | Tentativa iniciada")
+
+    for attempt in range(4):   # 4 tentativas
         try:
             url = f"https://rubinot.com.br/?subtopic=characters&name={nome.replace(' ', '+')}"
+            print(f"[DEBUG] Tentativa {attempt+1}/4 → {url}")
 
-            resp = scraper.get(url, timeout=25)
+            resp = scraper.get(url, timeout=30)
+
+            print(f"[DEBUG] Status recebido: {resp.status_code}")
 
             if resp.status_code == 200:
+                print("[DEBUG] Sucesso! Status 200")
                 break
-            else:
-                await asyncio.sleep(3)  # espera antes da próxima tentativa
-                continue
+
+            print(f"[DEBUG] Status diferente de 200: {resp.status_code} - Tentando novamente...")
+            await asyncio.sleep(4)
 
         except Exception as e:
-            if attempt == 2:  # última tentativa
-                return JSONResponse({
-                    "error": f"Falha ao acessar RubinOT (Cloudflare): {str(e)}",
-                    "attempts": attempt + 1
-                }, status_code=502)
-            await asyncio.sleep(3)
+            print(f"[DEBUG] Erro na tentativa {attempt+1}: {str(e)}")
+            if attempt == 3:
+                return JSONResponse({"error": f"Falha total após 4 tentativas: {str(e)}"}, status_code=502)
+            await asyncio.sleep(4)
 
     if resp.status_code != 200:
-        return JSONResponse({"error": f"RubinOT retornou {resp.status_code}"}, status_code=502)
+        return JSONResponse({"error": f"RubinOT bloqueou (Cloudflare) - Status {resp.status_code}"}, status_code=502)
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -78,7 +76,7 @@ async def search(nome: str = Query(..., description="Nome do personagem")):
         "last_login": None
     }
 
-    # Parser mais robusto (atualizado para o layout atual do RubinOT)
+    # Parser robusto
     for row in soup.find_all("tr"):
         cells = row.find_all("td")
         if len(cells) >= 2:
@@ -100,11 +98,8 @@ async def search(nome: str = Query(..., description="Nome do personagem")):
             elif any(x in label for x in ["last login", "último login", "lastlogin"]):
                 data["last_login"] = value
 
-    # Verifica se personagem existe
-    if data["level"] is None and ("não encontrado" in resp.text.lower() or "character not found" in resp.text.lower()):
-        return JSONResponse({"error": "Personagem não encontrado"}, status_code=404)
-
-    # Salva no cache
+    # Cache
     cache[key] = {"data": data, "timestamp": time.time()}
 
+    print(f"[DEBUG] Personagem encontrado: {data['nome']} - Level {data['level']}")
     return data
