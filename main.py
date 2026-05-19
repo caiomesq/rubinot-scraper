@@ -1,103 +1,89 @@
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 import cloudscraper
 from bs4 import BeautifulSoup
-from datetime import datetime, timedelta
-import asyncio
-from typing import Dict, Any
+import time
 
 app = FastAPI(title="RubinOT Scraper - Grátis")
 
-# Cache simples em memória (Render free reinicia de vez em quando, mas é OK)
-cache: Dict[str, tuple[Dict[str, Any], datetime]] = {}
-CACHE_TTL = 300  # 5 minutos
+# Scraper persistente (bypass Cloudflare)
+scraper = cloudscraper.create_scraper()
 
-scraper = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False})
+# Cache simples (5 minutos) - evita bater no RubinOT toda hora
+cache = {}
+CACHE_TTL = 300
 
-def parse_rubinot_character(html: str, searched_name: str) -> dict:
-    soup = BeautifulSoup(html, 'lxml')
-    character = {
-        "nome": searched_name,
-        "level": None,
-        "vocacao": None,
-        "guild": None,
-        "comment": None,
-        "status": "offline",
-        "last_login": None,
-        "erro": None
+@app.get("/")
+def root():
+    return {
+        "message": "✅ RubinOT Scraper está ONLINE (bypass Cloudflare)",
+        "status": "ok",
+        "uso": "https://rubinot-scraper.onrender.com/search?nome=SeuNome",
+        "endpoints": ["/search", "/health"]
     }
 
-    # Tabela de informações do personagem (padrão OT)
-    tables = soup.find_all('table', class_=lambda x: x and 'TableContent' in x or 'table' in x.lower())
-    for table in tables:
-        rows = table.find_all('tr')
-        for row in rows:
-            cells = row.find_all(['td', 'th'])
-            if len(cells) >= 2:
-                label = cells[0].get_text(strip=True).lower()
-                value = cells[1].get_text(strip=True)
-                if 'level' in label:
-                    character['level'] = value
-                elif 'vocação' in label or 'vocation' in label:
-                    character['vocacao'] = value
-                elif 'guild' in label:
-                    character['guild'] = value
-                elif 'comment' in label or 'comentário' in label or 'comentario' in label:
-                    character['comment'] = value
-                elif 'status' in label or 'online' in label:
-                    character['status'] = value.lower()
-                elif 'last login' in label or 'último login' in label:
-                    character['last_login'] = value
-
-    # Fallback: busca por texto direto na página
-    if not character['level']:
-        level_tag = soup.find(string=lambda text: text and 'Level:' in text)
-        if level_tag:
-            character['level'] = level_tag.find_next().get_text(strip=True) if hasattr(level_tag, 'find_next') else None
-
-    if character['level'] is None and character['vocacao'] is None:
-        character['erro'] = 'Personagem não encontrado ou página bloqueada'
-
-    return character
-
+@app.get("/health")
+def health():
+    return {"status": "healthy", "timestamp": time.time()}
 
 @app.get("/search")
-async def search_character(nome: str = Query(..., description="Nome do personagem")):
-    name_clean = nome.strip().lower()
+def search(nome: str = Query(..., description="Nome do personagem")):
+    key = nome.strip().lower()
 
-    # Verifica cache
-    now = datetime.now()
-    if name_clean in cache:
-        data, expiry = cache[name_clean]
-        if now < expiry:
-            return data
+    # Cache
+    if key in cache and time.time() - cache[key]["timestamp"] < CACHE_TTL:
+        return cache[key]["data"]
 
     try:
         url = f"https://rubinot.com.br/?subtopic=characters&name={nome.replace(' ', '+')}"
-        response = scraper.get(url, timeout=15)
 
-        if response.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"RubinOT retornou {response.status_code}")
+        resp = scraper.get(url, timeout=20)
 
-        character_data = parse_rubinot_character(response.text, nome)
+        if resp.status_code != 200:
+            return JSONResponse({"error": f"RubinOT retornou {resp.status_code}"}, status_code=502)
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        data = {
+            "nome": nome,
+            "level": None,
+            "vocacao": None,
+            "guild": None,
+            "comment": None,
+            "status": "offline",
+            "last_login": None
+        }
+
+        # Parser atualizado e robusto (funciona no RubinOT 2026)
+        for row in soup.find_all("tr"):
+            cells = row.find_all("td")
+            if len(cells) >= 2:
+                label = cells[0].get_text(strip=True).lower()
+                value = cells[1].get_text(strip=True)
+
+                if any(x in label for x in ["name", "nome"]):
+                    data["nome"] = value
+                elif any(x in label for x in ["level", "nível"]):
+                    data["level"] = int(value) if value.isdigit() else value
+                elif any(x in label for x in ["vocation", "vocação", "vocacao"]):
+                    data["vocacao"] = value
+                elif any(x in label for x in ["guild", "guilda"]):
+                    data["guild"] = value if value and value.lower() != "none" else None
+                elif any(x in label for x in ["comment", "comentário", "comentario"]):
+                    data["comment"] = value
+                elif any(x in label for x in ["status", "online"]):
+                    data["status"] = value.lower()
+                elif any(x in label for x in ["last login", "último login", "lastlogin"]):
+                    data["last_login"] = value
+
+        # Personagem não existe?
+        if data["level"] is None and "não encontrado" in resp.text.lower():
+            return JSONResponse({"error": "Personagem não encontrado"}, status_code=404)
 
         # Salva no cache
-        cache[name_clean] = (character_data, now + timedelta(seconds=CACHE_TTL))
+        cache[key] = {"data": data, "timestamp": time.time()}
 
-        return character_data
+        return data
 
     except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"erro": f"Erro ao buscar: {str(e)}", "nome": nome}
-        )
-
-
-@app.get("/health")
-async def health():
-    return {"status": "online", "cache_size": len(cache), "timestamp": datetime.now().isoformat()}
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=10000)
+        return JSONResponse({"error": f"Erro interno: {str(e)}"}, status_code=500)
