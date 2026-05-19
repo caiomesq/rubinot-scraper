@@ -1,31 +1,19 @@
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
-import cloudscraper
+from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
-import time
 import asyncio
+import time
 
-app = FastAPI(title="RubinOT Scraper - Grátis")
+app = FastAPI(title="RubinOT Scraper - Playwright (Grátis 2026)")
 
-# === CONFIGURAÇÃO MAIS FORTE CONTRA CLOUDFLARE 2026 ===
-scraper = cloudscraper.create_scraper(
-    browser={
-        'browser': 'chrome',
-        'platform': 'windows',
-        'mobile': False
-    },
-    delay=10,                    # delay maior
-    debug=False
-)
-
-# Cache (5 minutos)
 cache = {}
 CACHE_TTL = 300
 
 @app.get("/")
 def root():
     return {
-        "message": "✅ RubinOT Scraper ONLINE (bypass reforçado + debug)",
+        "message": "✅ RubinOT Scraper ONLINE com Playwright + Stealth",
         "status": "ok",
         "teste": "https://rubinot-scraper.onrender.com/search?nome=Mekbek"
     }
@@ -37,69 +25,62 @@ async def search(nome: str = Query(..., description="Nome do personagem")):
     if key in cache and time.time() - cache[key]["timestamp"] < CACHE_TTL:
         return cache[key]["data"]
 
-    print(f"[DEBUG] Buscando: {nome} | Tentativa iniciada")
+    async with async_playwright() as p:
+        # Browser com stealth forte
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+        )
+        page = await context.new_page()
 
-    for attempt in range(4):   # 4 tentativas
         try:
             url = f"https://rubinot.com.br/?subtopic=characters&name={nome.replace(' ', '+')}"
-            print(f"[DEBUG] Tentativa {attempt+1}/4 → {url}")
+            await page.goto(url, wait_until="networkidle", timeout=45000)
 
-            resp = scraper.get(url, timeout=30)
+            # Espera extra para Cloudflare resolver o desafio
+            await asyncio.sleep(8)
 
-            print(f"[DEBUG] Status recebido: {resp.status_code}")
+            html = await page.content()
+            soup = BeautifulSoup(html, "html.parser")
 
-            if resp.status_code == 200:
-                print("[DEBUG] Sucesso! Status 200")
-                break
+            data = {
+                "nome": nome,
+                "level": None,
+                "vocacao": None,
+                "guild": None,
+                "comment": None,
+                "status": "offline",
+                "last_login": None
+            }
 
-            print(f"[DEBUG] Status diferente de 200: {resp.status_code} - Tentando novamente...")
-            await asyncio.sleep(4)
+            for row in soup.find_all("tr"):
+                cells = row.find_all("td")
+                if len(cells) >= 2:
+                    label = cells[0].get_text(strip=True).lower()
+                    value = cells[1].get_text(strip=True)
+
+                    if any(x in label for x in ["name", "nome"]):
+                        data["nome"] = value
+                    elif any(x in label for x in ["level", "nível", "nivel"]):
+                        data["level"] = int(value) if value.isdigit() else value
+                    elif any(x in label for x in ["vocation", "vocação", "vocacao"]):
+                        data["vocacao"] = value
+                    elif any(x in label for x in ["guild", "guilda"]):
+                        data["guild"] = value if value.lower() != "none" else None
+                    elif any(x in label for x in ["comment", "comentário", "comentario"]):
+                        data["comment"] = value
+                    elif any(x in label for x in ["status", "online"]):
+                        data["status"] = "online" if "online" in value.lower() else "offline"
+                    elif any(x in label for x in ["last login", "último login", "lastlogin"]):
+                        data["last_login"] = value
+
+            # Cache
+            cache[key] = {"data": data, "timestamp": time.time()}
+
+            await browser.close()
+            return data
 
         except Exception as e:
-            print(f"[DEBUG] Erro na tentativa {attempt+1}: {str(e)}")
-            if attempt == 3:
-                return JSONResponse({"error": f"Falha total após 4 tentativas: {str(e)}"}, status_code=502)
-            await asyncio.sleep(4)
-
-    if resp.status_code != 200:
-        return JSONResponse({"error": f"RubinOT bloqueou (Cloudflare) - Status {resp.status_code}"}, status_code=502)
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    data = {
-        "nome": nome,
-        "level": None,
-        "vocacao": None,
-        "guild": None,
-        "comment": None,
-        "status": "offline",
-        "last_login": None
-    }
-
-    # Parser robusto
-    for row in soup.find_all("tr"):
-        cells = row.find_all("td")
-        if len(cells) >= 2:
-            label = cells[0].get_text(strip=True).lower()
-            value = cells[1].get_text(strip=True)
-
-            if any(x in label for x in ["name", "nome"]):
-                data["nome"] = value
-            elif any(x in label for x in ["level", "nível", "nivel"]):
-                data["level"] = int(value) if value.isdigit() else value
-            elif any(x in label for x in ["vocation", "vocação", "vocacao"]):
-                data["vocacao"] = value
-            elif any(x in label for x in ["guild", "guilda"]):
-                data["guild"] = value if value and value.lower() != "none" else None
-            elif any(x in label for x in ["comment", "comentário", "comentario"]):
-                data["comment"] = value
-            elif any(x in label for x in ["status", "online"]):
-                data["status"] = "online" if "online" in value.lower() else "offline"
-            elif any(x in label for x in ["last login", "último login", "lastlogin"]):
-                data["last_login"] = value
-
-    # Cache
-    cache[key] = {"data": data, "timestamp": time.time()}
-
-    print(f"[DEBUG] Personagem encontrado: {data['nome']} - Level {data['level']}")
-    return data
+            await browser.close()
+            return JSONResponse({"error": f"Erro Playwright: {str(e)}"}, status_code=500)
